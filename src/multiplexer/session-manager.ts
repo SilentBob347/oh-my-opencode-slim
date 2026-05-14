@@ -407,7 +407,7 @@ export class MultiplexerSessionManager {
     const tracked = this.sessions.get(sessionId);
     if (!tracked) {
       if (
-        this.spawningSessions.has(sessionId) ||
+        this.spawningSessions.has(sessionId) &&
         this.knownSessions.has(sessionId)
       ) {
         this.pendingIdleSessions.set(sessionId, now);
@@ -446,7 +446,7 @@ export class MultiplexerSessionManager {
       tracked.missingSince = undefined;
       tracked.lastSeenAt = now;
     } else if (
-      this.spawningSessions.has(sessionId) ||
+      this.spawningSessions.has(sessionId) &&
       this.knownSessions.has(sessionId)
     ) {
       this.pendingBusySessions.add(sessionId);
@@ -588,6 +588,8 @@ export class MultiplexerSessionManager {
     this.knownSessions.clear();
     this.spawningSessions.clear();
     this.closingSessions.clear();
+    this.pendingBusySessions.clear();
+    this.pendingIdleSessions.clear();
 
     if (this.enabled) {
       MultiplexerSessionManager.hasActiveController = false;

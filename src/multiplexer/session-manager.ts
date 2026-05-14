@@ -18,6 +18,8 @@ interface TrackedSession {
   directory: string;
   createdAt: number;
   lastSeenAt: number;
+  hasSeenBusy: boolean;
+  idleSince?: number;
   missingSince?: number;
 }
 
@@ -44,6 +46,8 @@ interface SessionEvent {
 type CloseReason = 'idle' | 'deleted' | 'missing' | 'timeout';
 
 const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
+const SESSION_IDLE_GRACE_MS = 15 * 1000;
+const SESSION_IDLE_DEBOUNCE_MS = POLL_INTERVAL_BACKGROUND_MS * 2;
 const SESSION_MISSING_GRACE_MS = POLL_INTERVAL_BACKGROUND_MS * 3;
 
 /**
@@ -53,6 +57,9 @@ const SESSION_MISSING_GRACE_MS = POLL_INTERVAL_BACKGROUND_MS * 3;
  * with polling kept as a fallback for reliability.
  */
 export class MultiplexerSessionManager {
+  private static activeControllerKey: string | null = null;
+  private static hasActiveController = false;
+
   private client: OpencodeClient;
   private serverUrl: string;
   private directory: string;
@@ -60,6 +67,8 @@ export class MultiplexerSessionManager {
   private sessions = new Map<string, TrackedSession>();
   private knownSessions = new Map<string, KnownSession>();
   private spawningSessions = new Set<string>();
+  private pendingBusySessions = new Set<string>();
+  private pendingIdleSessions = new Map<string, number>();
   private closingSessions = new Map<string, Promise<void>>();
   private pollInterval?: ReturnType<typeof setInterval>;
   private enabled = false;
@@ -72,16 +81,43 @@ export class MultiplexerSessionManager {
       ctx.serverUrl?.toString() ?? `http://localhost:${defaultPort}`;
 
     this.multiplexer = getMultiplexer(config);
+    const controllerKey = this.getControllerKey(config.type);
+    let isController = false;
+    if (controllerKey !== null) {
+      if (!MultiplexerSessionManager.hasActiveController) {
+        MultiplexerSessionManager.activeControllerKey = controllerKey;
+        MultiplexerSessionManager.hasActiveController = true;
+        isController = true;
+      } else {
+        isController = false;
+      }
+    }
+
     this.enabled =
+      process.env.OMOS_MULTIPLEXER_CHILD !== '1' &&
       config.type !== 'none' &&
-      this.multiplexer !== null &&
-      this.multiplexer.isInsideSession();
+      this.multiplexer?.isInsideSession() === true &&
+      isController;
 
     log('[multiplexer-session-manager] initialized', {
       enabled: this.enabled,
       type: config.type,
       serverUrl: this.serverUrl,
+      controllerKey,
+      activeControllerKey: MultiplexerSessionManager.activeControllerKey,
     });
+  }
+
+  private getControllerKey(type: MultiplexerConfig['type']): string | null {
+    if (type === 'tmux') {
+      return process.env.TMUX_PANE ?? null;
+    }
+
+    if (type === 'zellij') {
+      return process.env.ZELLIJ_PANE_ID ?? process.env.ZELLIJ ?? null;
+    }
+
+    return null;
   }
 
   async onSessionCreated(event: SessionEvent): Promise<void> {
@@ -100,6 +136,18 @@ export class MultiplexerSessionManager {
 
     if (this.isTrackedOrSpawning(sessionId)) {
       log('[multiplexer-session-manager] session already tracked or spawning', {
+        sessionId,
+      });
+      return;
+    }
+
+    if (this.knownSessions.has(sessionId)) {
+      this.knownSessions.set(sessionId, {
+        parentId,
+        title,
+        directory,
+      });
+      log('[multiplexer-session-manager] known session create ignored', {
         sessionId,
       });
       return;
@@ -169,6 +217,7 @@ export class MultiplexerSessionManager {
       }
 
       const now = Date.now();
+      const pendingIdleSince = this.pendingIdleSessions.get(sessionId);
       this.sessions.set(sessionId, {
         sessionId,
         paneId: paneResult.paneId,
@@ -177,7 +226,11 @@ export class MultiplexerSessionManager {
         directory,
         createdAt: now,
         lastSeenAt: now,
+        hasSeenBusy: this.pendingBusySessions.has(sessionId),
+        idleSince: pendingIdleSince,
       });
+      this.pendingBusySessions.delete(sessionId);
+      this.pendingIdleSessions.delete(sessionId);
 
       log('[multiplexer-session-manager] pane spawned', {
         sessionId,
@@ -192,17 +245,23 @@ export class MultiplexerSessionManager {
 
   async onSessionStatus(event: SessionEvent): Promise<void> {
     if (!this.enabled) return;
-    if (event.type !== 'session.status') return;
+    if (event.type !== 'session.status' && event.type !== 'session.idle') {
+      return;
+    }
 
     const sessionId = event.properties?.sessionID;
     if (!sessionId) return;
 
-    if (event.properties?.status?.type === 'idle') {
-      await this.closeSession(sessionId, 'idle');
+    if (
+      event.type === 'session.idle' ||
+      event.properties?.status?.type === 'idle'
+    ) {
+      await this.closeIfIdleConfirmed(sessionId, Date.now());
       return;
     }
 
     if (event.properties?.status?.type === 'busy') {
+      this.markBusy(sessionId);
       await this.respawnIfKnown(sessionId);
     }
   }
@@ -263,19 +322,28 @@ export class MultiplexerSessionManager {
         if (status) {
           tracked.lastSeenAt = now;
           tracked.missingSince = undefined;
-        } else if (!tracked.missingSince) {
+          if (status.type === 'busy') {
+            this.markBusy(sessionId, now);
+          }
+        } else if (
+          tracked.hasSeenBusy &&
+          now - tracked.createdAt >= SESSION_IDLE_GRACE_MS &&
+          !tracked.missingSince
+        ) {
           tracked.missingSince = now;
         }
 
+        const idleConfirmed = isIdle && this.markIdleAndCheck(tracked, now);
         const missingTooLong =
+          tracked.hasSeenBusy &&
           !!tracked.missingSince &&
           now - tracked.missingSince >= SESSION_MISSING_GRACE_MS;
         const isTimedOut = now - tracked.createdAt > SESSION_TIMEOUT_MS;
 
-        if (isIdle || missingTooLong || isTimedOut) {
+        if (idleConfirmed || missingTooLong || isTimedOut) {
           sessionsToClose.push({
             sessionId,
-            reason: isIdle ? 'idle' : isTimedOut ? 'timeout' : 'missing',
+            reason: idleConfirmed ? 'idle' : isTimedOut ? 'timeout' : 'missing',
           });
         }
       }
@@ -294,6 +362,8 @@ export class MultiplexerSessionManager {
   ): Promise<void> {
     if (reason === 'deleted') {
       this.knownSessions.delete(sessionId);
+      this.pendingBusySessions.delete(sessionId);
+      this.pendingIdleSessions.delete(sessionId);
     }
 
     const existingClose = this.closingSessions.get(sessionId);
@@ -328,6 +398,60 @@ export class MultiplexerSessionManager {
 
     this.closingSessions.set(sessionId, closePromise);
     await closePromise;
+  }
+
+  private async closeIfIdleConfirmed(
+    sessionId: string,
+    now: number,
+  ): Promise<void> {
+    const tracked = this.sessions.get(sessionId);
+    if (!tracked) {
+      if (
+        this.spawningSessions.has(sessionId) &&
+        this.knownSessions.has(sessionId)
+      ) {
+        this.pendingIdleSessions.set(sessionId, now);
+      }
+      return;
+    }
+
+    if (this.markIdleAndCheck(tracked, now)) {
+      await this.closeSession(sessionId, 'idle');
+    }
+  }
+
+  private markIdleAndCheck(tracked: TrackedSession, now: number): boolean {
+    tracked.lastSeenAt = now;
+    tracked.missingSince = undefined;
+
+    if (!tracked.idleSince) {
+      tracked.idleSince = now;
+      log('[multiplexer-session-manager] idle observed, waiting to confirm', {
+        sessionId: tracked.sessionId,
+      });
+      return false;
+    }
+
+    return (
+      now - tracked.createdAt >= SESSION_IDLE_GRACE_MS &&
+      now - tracked.idleSince >= SESSION_IDLE_DEBOUNCE_MS
+    );
+  }
+
+  private markBusy(sessionId: string, now = Date.now()): void {
+    const tracked = this.sessions.get(sessionId);
+    if (tracked) {
+      tracked.hasSeenBusy = true;
+      tracked.idleSince = undefined;
+      tracked.missingSince = undefined;
+      tracked.lastSeenAt = now;
+    } else if (
+      this.spawningSessions.has(sessionId) &&
+      this.knownSessions.has(sessionId)
+    ) {
+      this.pendingBusySessions.add(sessionId);
+      this.pendingIdleSessions.delete(sessionId);
+    }
   }
 
   private async respawnIfKnown(sessionId: string): Promise<void> {
@@ -407,6 +531,7 @@ export class MultiplexerSessionManager {
         directory: known.directory,
         createdAt: now,
         lastSeenAt: now,
+        hasSeenBusy: true,
       });
 
       log('[multiplexer-session-manager] pane respawned on busy', {
@@ -463,6 +588,13 @@ export class MultiplexerSessionManager {
     this.knownSessions.clear();
     this.spawningSessions.clear();
     this.closingSessions.clear();
+    this.pendingBusySessions.clear();
+    this.pendingIdleSessions.clear();
+
+    if (this.enabled) {
+      MultiplexerSessionManager.hasActiveController = false;
+      MultiplexerSessionManager.activeControllerKey = null;
+    }
 
     log('[multiplexer-session-manager] cleanup complete');
   }
